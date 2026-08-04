@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime
 import logging
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.gtfs.matching import match_stop_time
@@ -227,3 +228,56 @@ def compute_deviations_from_vehicle_positions(session: Session, vehicle_position
         )
 
     return deviations
+
+
+_UPSERT_COLUMNS = (
+    "route_id",
+    "stop_id",
+    "scheduled_time_seconds",
+    "actual_time",
+    "delay_seconds",
+    "source",
+    "match_type",
+    "computed_at",
+)
+
+
+def upsert_schedule_deviations(session: Session, deviations: list[ScheduleDeviation]) -> None:
+    """Persist computed deviations, one row per (trip_id, stop_sequence,
+    service_date, event_type) - see ScheduleDeviation's docstring for why
+    this must be an upsert and not a plain insert. A stop's row keeps
+    refining across polls as TripUpdates predictions firm up, and stops
+    changing once VIA's feed drops predictions for a stop the vehicle has
+    already passed.
+    """
+    if not deviations:
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rows = {}
+    for d in deviations:
+        key = (d.trip_id, d.stop_sequence, d.service_date, d.event_type)
+        # Last one wins if this poll somehow produced two candidates for the
+        # same stop-visit (e.g. a nearest-geographic collision) - avoids a
+        # Postgres "ON CONFLICT DO UPDATE affects row a second time" error.
+        rows[key] = {
+            "trip_id": d.trip_id,
+            "route_id": d.route_id,
+            "stop_id": d.stop_id,
+            "stop_sequence": d.stop_sequence,
+            "service_date": d.service_date,
+            "scheduled_time_seconds": d.scheduled_time_seconds,
+            "actual_time": d.actual_time,
+            "delay_seconds": d.delay_seconds,
+            "event_type": d.event_type,
+            "source": d.source,
+            "match_type": d.match_type,
+            "computed_at": now,
+        }
+
+    stmt = pg_insert(ScheduleDeviation).values(list(rows.values()))
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["trip_id", "stop_sequence", "service_date", "event_type"],
+        set_={col: getattr(stmt.excluded, col) for col in _UPSERT_COLUMNS},
+    )
+    session.execute(stmt)

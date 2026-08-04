@@ -13,7 +13,11 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.gtfs.bunching import detect_bunching
-from app.gtfs.deviation import compute_deviations_from_trip_updates, compute_deviations_from_vehicle_positions
+from app.gtfs.deviation import (
+    compute_deviations_from_trip_updates,
+    compute_deviations_from_vehicle_positions,
+    upsert_schedule_deviations,
+)
 from app.gtfs.realtime import fetch_trip_updates, fetch_vehicle_positions
 from app.models import VehiclePositionSnapshot
 
@@ -55,8 +59,11 @@ def poll_once(session: Session) -> dict:
 
     tu_deviations = compute_deviations_from_trip_updates(session, trip_updates)
     vp_deviations = compute_deviations_from_vehicle_positions(session, vehicle_positions)
-    session.add_all(tu_deviations)
-    session.add_all(vp_deviations)
+    # Upsert, not insert - see ScheduleDeviation's docstring. Without this,
+    # TripUpdates' predictions-for-every-remaining-stop behavior turns this
+    # into ~12M redundant rows/day instead of one row per realized stop visit.
+    upsert_schedule_deviations(session, tu_deviations)
+    upsert_schedule_deviations(session, vp_deviations)
 
     # trip_updates are the more authoritative source (explicit per-stop
     # predictions from the agency's own system) - prefer them when a trip

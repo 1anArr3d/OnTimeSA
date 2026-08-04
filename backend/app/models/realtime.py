@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Date, JSON
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Date, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -36,9 +36,28 @@ class VehiclePositionSnapshot(Base):
 class ScheduleDeviation(Base):
     """Computed delay (actual vs. scheduled) for a trip at a stop, derived from
     a vehicle position/trip update snapshot compared against static stop_times.
+
+    One row per realized (trip, stop-visit, service_date, event_type) - NOT
+    one row per poll. GTFS-RT TripUpdates sends predictions for every
+    remaining stop on a trip, not just the next one, so without the unique
+    constraint below this table would gain a near-duplicate row for every
+    still-far-away stop on every ~45s poll (measured: ~12M rows/day from
+    this alone). The upsert in app/gtfs/deviation.py keys on the constraint
+    below, so a stop's row keeps refining as predictions firm up and then
+    naturally stops changing once the vehicle passes it and VIA's feed stops
+    sending predictions for it.
+
+    stop_sequence (not stop_id) is part of the key deliberately - a loop
+    route can revisit the same physical stop twice in one trip, and stop_id
+    alone would incorrectly collapse those into a single row.
     """
 
     __tablename__ = "schedule_deviations"
+    __table_args__ = (
+        UniqueConstraint(
+            "trip_id", "stop_sequence", "service_date", "event_type", name="uq_schedule_deviation_stop_visit"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trip_id: Mapped[str] = mapped_column(ForeignKey("trips.trip_id"), index=True)
