@@ -1,0 +1,198 @@
+# SA Transit Pulse
+
+A reliability-tracking dashboard for VIA Metropolitan Transit's (San Antonio) bus
+network: live vehicle positions, historical on-time performance by route/stop,
+bus-bunching detection, and a personalized "check my commute" reliability lookup
+for a single route segment.
+
+Google Maps and VIA's own trip planner already answer "where's my bus right now."
+This project answers a different question they don't: **how has this route
+actually performed**, based purely on comparing VIA's GTFS-Realtime feed against
+its published GTFS static schedule over time. It does not make causal claims about
+*why* a route is unreliable (weather, traffic signals, etc.) - only what the data
+shows.
+
+Data provided by VIA Metropolitan Transit, via their [documented GTFS / GTFS-Realtime
+feeds](https://www.viainfo.net/developers-resources/). No other data source is used.
+
+## Architecture
+
+```
+backend/    FastAPI + SQLAlchemy + Postgres (Neon)
+  app/gtfs/       GTFS static parsing/loading, GTFS-RT polling & decoding,
+                  timezone normalization, stop matching, deviation calc,
+                  bunching detection
+  app/api/        FastAPI routers
+  app/*_service.py  Query/aggregation logic behind each router
+  app/poller.py   One GTFS-RT poll cycle; also the recurring-job entrypoint
+  tests/          pytest suite (parsing, matching, timezone math, reliability
+                  aggregation, bunching detection)
+
+frontend/   React + TypeScript + Vite
+  src/pages/      LiveMap, Dashboard, CheckMyCommute
+  src/api/        Typed fetch client against the backend
+  src/components/ Shared UI (confidence badges, status badges, bunching
+                  summary card, nav)
+```
+
+### Data model
+
+- **Static schedule** (`routes`, `stops`, `trips`, `stop_times`, `calendar`) -
+  loaded from VIA's GTFS static zip, refreshed periodically. Upserted, not
+  truncated-and-reloaded, so historical rows in the tables below never lose
+  their foreign keys when a trip drops out of a refreshed feed.
+- **`vehicle_position_snapshots`** - one row per polled vehicle position.
+  Time-series, never overwritten.
+- **`schedule_deviations`** - computed delay per (trip, stop, event), tagged
+  with which GTFS-RT feed it came from and how confidently the stop was
+  matched (`exact_sequence` / `exact_stop_id` / `nearest_geographic`).
+- **`headway_samples`** - every consecutive-vehicle-pair headway comparison
+  computed during bunching detection, logged whether or not it crossed the
+  bunching threshold - kept so the threshold can be tuned against real
+  headway variance later instead of guessed upfront.
+- **`bunching_events`** - the subset of headway samples that crossed the
+  threshold, merged across polls into a single ongoing event rather than
+  duplicated every cycle.
+
+## Setup
+
+### Prerequisites
+
+- Python 3.12+, Node 20+
+- A Postgres database (developed against [Neon](https://neon.tech))
+
+### Backend
+
+```bash
+cd backend
+python -m venv ../.venv          # or use an existing venv
+../.venv/Scripts/activate        # Windows; `source ../.venv/bin/activate` on Unix
+pip install -r requirements.txt
+
+cp .env.example .env
+# edit .env: set SATP_DATABASE_URL to your Postgres connection string
+```
+
+Load the static schedule and create tables for the first time:
+
+```bash
+python -c "
+from app.db import Base, get_engine
+from app import models
+Base.metadata.create_all(get_engine())
+"
+python -c "
+from app.db import get_sessionmaker
+from app.gtfs.static import fetch_and_parse
+from app.gtfs.loader import load_static_feed
+session = get_sessionmaker()()
+load_static_feed(session, fetch_and_parse())
+"
+```
+
+Run the API:
+
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+Run the test suite:
+
+```bash
+pytest                      # everything, including one live network call to VIA
+pytest -m "not integration" # skip the live-feed smoke test
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+cp .env.example .env   # defaults to http://localhost:8000, edit if the API lives elsewhere
+npm run dev
+```
+
+Open `http://localhost:5173`.
+
+## Scheduled ingestion jobs
+
+Two independent refresh cycles are needed in any real deployment - neither
+runs automatically outside of what's described here.
+
+**GTFS static refresh** (daily is plenty - VIA's schedule doesn't change
+intra-day): re-run the same two-line loader snippet from setup above (fetch +
+`load_static_feed`) on a cron/scheduled task. It's a safe upsert, not a
+destructive reload.
+
+**GTFS-RT polling** (every 30-60s, this project defaults to 45s via
+`SATP_GTFS_RT_POLL_SECONDS`): this is what populates vehicle positions,
+schedule deviations, and bunching detection. Two ways to run it:
+
+```bash
+# Option A: built-in APScheduler loop, blocks forever
+python -m app.poller  # single one-off poll
+python -c "from app.poller import run_scheduler; run_scheduler()"  # recurring
+
+# Option B: external scheduler (cron, systemd timer, etc.) calling a single poll
+python -m app.poller
+```
+
+Prefer option B (external scheduler) for anything long-running in production -
+it survives a poll cycle hanging or crashing without taking the whole process
+down, which `run_scheduler()`'s in-process loop won't.
+
+**A note on data freshness:** the Dashboard only reflects however long the
+poller has actually been running continuously. A fresh deployment that's only
+been polling for a few hours will show a sparse or empty bunching-events card
+and low `n=` sample counts on the reliability lookups - that's expected, not
+broken. The bunching events card's empty state says as much directly, rather
+than looking like a bug. The reliability numbers (and especially bunching
+frequency, which needs enough headway samples to be statistically meaningful)
+get materially more trustworthy after the poller's been running for days/weeks,
+not hours.
+
+### Changelog: fixed a storage runaway bug (2026-08-03)
+
+Early testing surfaced that `schedule_deviations` was growing at ~510K
+rows/hour (~2+ GB/day) - VIA's TripUpdates feed sends predictions for every
+remaining stop on a trip, not just the next one, and the original code
+inserted a new row for each one on every poll, even for stops the vehicle
+was still an hour away from. Fixed by upserting on
+`(trip_id, stop_sequence, service_date, event_type)` instead of always
+inserting - each stop-visit now gets exactly one row that refines as
+predictions firm up and stops changing once the vehicle passes it. Verified
+by watching a single stop's row across 4 consecutive polls: same row `id`
+throughout, value stable, and total table growth dropped from ~17,000
+new rows/poll to ~40. The pre-fix table (638K redundant rows) was truncated
+as part of this fix - no real historical signal was lost, since none of those
+rows represented data older than a few hours.
+
+## Roadmap (explicitly out of scope for this version)
+
+These were deliberately not built, to keep this version's scope to reliability
+tracking rather than trip planning:
+
+- **Multi-route trip comparison** - comparing a direct route against an
+  alternative with a transfer (A→B direct vs. A→C→B). This version is
+  single-route, no-transfer only, by design.
+- **Route optimization / suggestion** - recommending a faster alternative
+  route using a graph/pathfinding algorithm over live reliability data. Real,
+  substantial future work; not attempted here.
+- **Turn-by-turn "where's my bus" ETAs** - already solved well by Google Maps
+  and the Transit app; this project is a historical-reliability complement to
+  those, not a competitor.
+- **Causal analysis of delays** (weather, traffic signals, etc.) - this
+  version reports GTFS-RT-vs-schedule comparisons only, no causal claims.
+
+## Notable finding
+
+Route 103 (Primo Zarzamora) has run at roughly 40% on-time performance across
+500+ real observations during development of this project - a concrete,
+honestly-surfaced example of exactly what this tool is for.
+
+## License / attribution
+
+Transit data is provided by VIA Metropolitan Transit under their [Developer's
+License Agreement](https://www.viainfo.net/developers-resources/). VIA does
+not guarantee the accuracy, completeness, or availability of the underlying
+data.
