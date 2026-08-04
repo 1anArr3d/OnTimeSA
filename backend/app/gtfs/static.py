@@ -4,7 +4,11 @@ The feed is a zip of CSV files per the GTFS spec:
 https://code.google.com/transit/spec/transit_feed_specification.html
 
 This module only parses the files this project actually uses:
-routes.txt, stops.txt, trips.txt, stop_times.txt, calendar.txt.
+routes.txt, stops.txt, trips.txt, stop_times.txt, calendar.txt, shapes.txt.
+
+shapes.txt is optional per the GTFS spec (unlike the others, which are
+required) - if a feed omits it, shapes just comes back empty and route-shape
+rendering degrades gracefully rather than failing ingestion.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ class GtfsStaticFeed:
     trips: list[dict]
     stop_times: list[dict]
     calendar: list[dict]
+    shapes: list[dict]
 
 
 def download_static_feed(url: str | None = None, timeout: int = 60) -> bytes:
@@ -90,6 +95,7 @@ def parse_static_feed(zip_bytes: bytes) -> GtfsStaticFeed:
         trips_raw = _read_csv_rows(archive, "trips.txt")
         stop_times_raw = _read_csv_rows(archive, "stop_times.txt")
         calendar_raw = _read_csv_rows(archive, "calendar.txt")
+        shapes_raw = _read_csv_rows(archive, "shapes.txt") if "shapes.txt" in available else []
 
     routes = [
         {
@@ -160,16 +166,27 @@ def parse_static_feed(zip_bytes: bytes) -> GtfsStaticFeed:
         for c in calendar_raw
     ]
 
+    shapes = [
+        {
+            "shape_id": sh["shape_id"],
+            "shape_pt_sequence": int(sh["shape_pt_sequence"]),
+            "shape_pt_lat": float(sh["shape_pt_lat"]),
+            "shape_pt_lon": float(sh["shape_pt_lon"]),
+        }
+        for sh in shapes_raw
+    ]
+
     logger.info(
-        "Parsed GTFS static feed: %d routes, %d stops, %d trips, %d stop_times, %d calendar entries",
+        "Parsed GTFS static feed: %d routes, %d stops, %d trips, %d stop_times, %d calendar entries, %d shape points",
         len(routes),
         len(stops),
         len(trips),
         len(stop_times),
         len(calendar),
+        len(shapes),
     )
 
-    return GtfsStaticFeed(routes=routes, stops=stops, trips=trips, stop_times=stop_times, calendar=calendar)
+    return GtfsStaticFeed(routes=routes, stops=stops, trips=trips, stop_times=stop_times, calendar=calendar, shapes=shapes)
 
 
 def fetch_and_parse(url: str | None = None) -> GtfsStaticFeed:

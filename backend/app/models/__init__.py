@@ -1,4 +1,4 @@
-from app.models.gtfs_static import Route, Stop, Trip, StopTime, Calendar
+from app.models.gtfs_static import Route, Stop, Trip, StopTime, Calendar, Shape
 from app.models.realtime import (
     VehiclePositionSnapshot,
     ScheduleDeviation,
@@ -12,6 +12,7 @@ __all__ = [
     "Trip",
     "StopTime",
     "Calendar",
+    "Shape",
     "VehiclePositionSnapshot",
     "ScheduleDeviation",
     "BunchingEvent",

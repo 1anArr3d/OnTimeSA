@@ -15,7 +15,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.gtfs.static import GtfsStaticFeed
-from app.models import Calendar, Route, Stop, StopTime, Trip
+from app.models import Calendar, Route, Shape, Stop, StopTime, Trip
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ def load_static_feed(session: Session, feed: GtfsStaticFeed) -> None:
     _upsert(session, Route, feed.routes, ["route_id"])
     _upsert(session, Stop, feed.stops, ["stop_id"])
     _upsert(session, Calendar, feed.calendar, ["service_id"])
+    _upsert(session, Shape, feed.shapes, ["shape_id", "shape_pt_sequence"])
     session.flush()
 
     _upsert(session, Trip, feed.trips, ["trip_id"])

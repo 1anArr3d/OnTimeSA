@@ -74,6 +74,20 @@ class Trip(Base):
     stop_times: Mapped[list["StopTime"]] = relationship(back_populates="trip")
 
 
+class Shape(Base):
+    """From GTFS static shapes.txt - the road-following polyline a route's
+    trips run along (distinct from stop_times' scheduled stop sequence, and
+    distinct from a specific vehicle's actual driven GPS path - this is
+    "the road the route is supposed to follow", published by VIA)."""
+
+    __tablename__ = "shapes"
+
+    shape_id: Mapped[str] = mapped_column(String, primary_key=True)
+    shape_pt_sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shape_pt_lat: Mapped[float] = mapped_column(Float)
+    shape_pt_lon: Mapped[float] = mapped_column(Float)
+
+
 class StopTime(Base):
     """From GTFS static stop_times.txt.
 
