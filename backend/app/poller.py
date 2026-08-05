@@ -16,6 +16,7 @@ from app.gtfs.bunching import detect_bunching
 from app.gtfs.deviation import (
     compute_deviations_from_trip_updates,
     compute_deviations_from_vehicle_positions,
+    load_trip_context,
     upsert_schedule_deviations,
 )
 from app.gtfs.realtime import fetch_trip_updates, fetch_vehicle_positions
@@ -38,6 +39,17 @@ def poll_once(session: Session) -> dict:
     trip_updates = fetch_trip_updates()
     logger.info("Polled %d vehicle positions, %d trip update stop-times", len(vehicle_positions), len(trip_updates))
 
+    # Load each active trip's static schedule context ONCE for the union of
+    # every trip_id any of the three consumers below might need, instead of
+    # each independently re-querying Postgres for its own heavily-overlapping
+    # subset - measured as ~2x redundant stop_times rows fetched per poll
+    # before this change (the deviation/bunching candidate sets are subsets
+    # of "every trip_id with a vehicle report", so this union is a safe,
+    # simple superset rather than needing to replicate each function's exact
+    # candidate-filtering logic here).
+    all_trip_ids = {tu["trip_id"] for tu in trip_updates} | {vp["trip_id"] for vp in vehicle_positions if vp["trip_id"]}
+    trip_context = load_trip_context(session, all_trip_ids)
+
     snapshots = [
         VehiclePositionSnapshot(
             vehicle_id=vp["vehicle_id"],
@@ -57,8 +69,8 @@ def poll_once(session: Session) -> dict:
     ]
     session.add_all(snapshots)
 
-    tu_deviations = compute_deviations_from_trip_updates(session, trip_updates)
-    vp_deviations = compute_deviations_from_vehicle_positions(session, vehicle_positions)
+    tu_deviations = compute_deviations_from_trip_updates(session, trip_updates, trip_context=trip_context)
+    vp_deviations = compute_deviations_from_vehicle_positions(session, vehicle_positions, trip_context=trip_context)
     # Upsert, not insert - see ScheduleDeviation's docstring. Without this,
     # TripUpdates' predictions-for-every-remaining-stop behavior turns this
     # into ~12M redundant rows/day instead of one row per realized stop visit.
@@ -71,7 +83,9 @@ def poll_once(session: Session) -> dict:
     trip_delays: dict[str, float] = {d.trip_id: d.delay_seconds for d in vp_deviations}
     trip_delays.update({d.trip_id: d.delay_seconds for d in tu_deviations})
 
-    headway_samples, bunching_events = detect_bunching(session, vehicle_positions, trip_delays, poll_time)
+    headway_samples, bunching_events = detect_bunching(
+        session, vehicle_positions, trip_delays, poll_time, trip_context=trip_context
+    )
     session.add_all(headway_samples)
     session.add_all(bunching_events)
 

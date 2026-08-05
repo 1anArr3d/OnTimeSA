@@ -82,12 +82,22 @@ def load_trip_context(session: Session, trip_ids: set[str]) -> dict[str, dict]:
     return context
 
 
-def compute_deviations_from_trip_updates(session: Session, trip_updates: list[dict]) -> list[ScheduleDeviation]:
+def compute_deviations_from_trip_updates(
+    session: Session, trip_updates: list[dict], trip_context: dict | None = None
+) -> list[ScheduleDeviation]:
+    """trip_context can be pre-loaded once by the caller (see app/poller.py)
+    and shared across this, compute_deviations_from_vehicle_positions(), and
+    detect_bunching() - their trip_id sets heavily overlap, and loading it
+    separately in each one measured as ~2x redundant stop_times rows fetched
+    per poll cycle. Falls back to loading it here if not given, so existing
+    callers/tests that only need this one function still work unchanged.
+    """
     if not trip_updates:
         return []
 
-    trip_ids = {tu["trip_id"] for tu in trip_updates}
-    trip_context = load_trip_context(session, trip_ids)
+    if trip_context is None:
+        trip_ids = {tu["trip_id"] for tu in trip_updates}
+        trip_context = load_trip_context(session, trip_ids)
 
     deviations: list[ScheduleDeviation] = []
     skipped_unknown_trip = 0
@@ -161,7 +171,11 @@ def compute_deviations_from_trip_updates(session: Session, trip_updates: list[di
     return deviations
 
 
-def compute_deviations_from_vehicle_positions(session: Session, vehicle_positions: list[dict]) -> list[ScheduleDeviation]:
+def compute_deviations_from_vehicle_positions(
+    session: Session, vehicle_positions: list[dict], trip_context: dict | None = None
+) -> list[ScheduleDeviation]:
+    """trip_context can be pre-loaded once and shared - see
+    compute_deviations_from_trip_updates()'s docstring."""
     candidates = [
         vp
         for vp in vehicle_positions
@@ -170,8 +184,9 @@ def compute_deviations_from_vehicle_positions(session: Session, vehicle_position
     if not candidates:
         return []
 
-    trip_ids = {vp["trip_id"] for vp in candidates}
-    trip_context = load_trip_context(session, trip_ids)
+    if trip_context is None:
+        trip_ids = {vp["trip_id"] for vp in candidates}
+        trip_context = load_trip_context(session, trip_ids)
 
     deviations: list[ScheduleDeviation] = []
     skipped_unknown_trip = 0

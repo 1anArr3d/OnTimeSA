@@ -75,9 +75,14 @@ def detect_bunching(
     vehicle_positions: list[dict],
     trip_delays: dict[str, float],
     poll_time: datetime.datetime,
+    trip_context: dict | None = None,
 ) -> tuple[list[HeadwaySample], list[BunchingEvent]]:
     """Compare consecutive vehicles per (route, direction) and return the raw
     headway samples plus any newly created/extended bunching events.
+
+    trip_context can be pre-loaded once and shared with the deviation
+    calculations - see compute_deviations_from_trip_updates()'s docstring
+    in app/gtfs/deviation.py.
     """
     threshold_seconds = settings.bunching_headway_threshold_minutes * 60
     min_scheduled_headway_seconds = settings.bunching_min_scheduled_headway_minutes * 60
@@ -91,8 +96,9 @@ def detect_bunching(
     if len(candidates) < 2:
         return [], []
 
-    trip_ids = {vp["trip_id"] for vp in candidates}
-    trip_context = load_trip_context(session, trip_ids)
+    if trip_context is None:
+        trip_ids = {vp["trip_id"] for vp in candidates}
+        trip_context = load_trip_context(session, trip_ids)
 
     candidates = [vp for vp in candidates if vp["trip_id"] in trip_context]
     candidates = [
