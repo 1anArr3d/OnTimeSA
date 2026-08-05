@@ -12,7 +12,15 @@ class Settings(BaseSettings):
     gtfs_rt_alerts_url: str = "http://gtfs.viainfo.net/alert/alerts.pb"
 
     gtfs_static_refresh_hours: int = 24
-    gtfs_rt_poll_seconds: int = 45
+    # 2 minutes, not 45s - see README changelog re: Neon free-tier storage
+    # cap. Still frequent enough to catch bunching events, which in practice
+    # have played out over multiple minutes in every real event detected so far.
+    gtfs_rt_poll_seconds: int = 120
+
+    # How many days of raw vehicle_position_snapshots / schedule_deviations
+    # to keep before the daily pruning job deletes them. Older history lives
+    # only in the daily_route_stats rollup after this window.
+    raw_data_retention_days: int = 5
 
     # Bunching detection thresholds
     bunching_headway_threshold_minutes: float = 3.0

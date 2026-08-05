@@ -4,6 +4,7 @@ from app.models.realtime import (
     ScheduleDeviation,
     BunchingEvent,
     HeadwaySample,
+    DailyRouteStat,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "ScheduleDeviation",
     "BunchingEvent",
     "HeadwaySample",
+    "DailyRouteStat",
 ]

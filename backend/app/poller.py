@@ -91,15 +91,19 @@ def poll_once(session: Session) -> dict:
 
 
 def run_scheduler() -> None:
-    """Run poll_once() on a recurring interval via APScheduler. Blocks forever."""
+    """Run poll_once() on a recurring interval, plus a once-daily rollup+prune
+    job, via APScheduler. Blocks forever.
+    """
     from apscheduler.schedulers.blocking import BlockingScheduler
 
     from app.config import settings
     from app.db import get_sessionmaker
+    from app.gtfs.timezone_utils import AGENCY_TIMEZONE
+    from app.rollup_service import run_daily_maintenance
 
     Session = get_sessionmaker()
 
-    def _job():
+    def _poll_job():
         session = Session()
         try:
             poll_once(session)
@@ -109,9 +113,29 @@ def run_scheduler() -> None:
         finally:
             session.close()
 
+    def _maintenance_job():
+        session = Session()
+        try:
+            summary = run_daily_maintenance(session)
+            logger.info("Daily rollup+prune complete: %s", summary)
+        except Exception:
+            logger.exception("Daily rollup+prune job failed")
+            session.rollback()
+        finally:
+            session.close()
+
     scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(_job, "interval", seconds=settings.gtfs_rt_poll_seconds, next_run_time=datetime.datetime.now())
-    logger.info("Starting GTFS-RT poll scheduler (every %ds)", settings.gtfs_rt_poll_seconds)
+    scheduler.add_job(
+        _poll_job, "interval", seconds=settings.gtfs_rt_poll_seconds, next_run_time=datetime.datetime.now()
+    )
+    # Shortly after agency-local midnight, so the rollup covers a fully
+    # completed service day before it runs.
+    scheduler.add_job(_maintenance_job, "cron", hour=0, minute=10, timezone=AGENCY_TIMEZONE)
+    logger.info(
+        "Starting GTFS-RT poll scheduler (every %ds) + daily rollup/prune job (00:10 %s)",
+        settings.gtfs_rt_poll_seconds,
+        AGENCY_TIMEZONE,
+    )
     scheduler.start()
 
 

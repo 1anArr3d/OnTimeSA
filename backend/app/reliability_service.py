@@ -16,6 +16,19 @@ Two entry points share the same underlying approach and response shape
 Both take an explicit start_date/end_date - reliability is a trend over a
 window, not a point-in-time snapshot, so date-range filtering is load-bearing
 from the start rather than bolted on.
+
+Raw schedule_deviations only covers the last settings.raw_data_retention_days
+days (see app/rollup_service.py - older rows get pruned after being rolled up
+into daily_route_stats). A date range that reaches further back than that
+gets split at the retention cutoff: the recent portion still queries raw
+data directly (full precision, segment/direction-specific), and the older
+portion is filled in from daily_route_stats (see _rollup_route_stats below).
+daily_route_stats only has route-level granularity (no per-stop/direction
+breakdown), so the historical portion of a segment lookup is necessarily a
+route-wide approximation rather than an exact segment figure - a known
+tradeoff of keeping the rollup table small. bunching_events is never pruned,
+so bunching counts always query the full range directly regardless of the
+split.
 """
 
 from __future__ import annotations
@@ -27,7 +40,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import BunchingEvent, Route, ScheduleDeviation, Stop, StopTime, Trip
+from app.models import BunchingEvent, DailyRouteStat, Route, ScheduleDeviation, Stop, StopTime, Trip
 from app.schemas import ReliabilityStats
 
 
@@ -45,6 +58,99 @@ def _on_time_case():
 
 def _confidence(sample_count: int) -> str:
     return "high" if sample_count >= settings.min_reliable_sample_count else "low"
+
+
+@dataclass
+class _DevStats:
+    sample_count: int = 0
+    avg_delay: float | None = None
+    on_time_count: float = 0.0
+
+
+def _raw_cutoff_date() -> datetime.date:
+    """Oldest service_date still guaranteed to exist in raw schedule_deviations."""
+    return datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=settings.raw_data_retention_days)
+
+
+def _split_range(start_date: datetime.date, end_date: datetime.date) -> tuple[tuple | None, tuple | None]:
+    """Split [start_date, end_date] into a (raw_start, raw_end) sub-range still
+    covered by raw data and a (rollup_start, rollup_end) sub-range that has to
+    come from daily_route_stats instead. Either half may be None if the
+    requested range doesn't touch it.
+    """
+    cutoff = _raw_cutoff_date()
+    raw_start = max(start_date, cutoff)
+    raw_range = (raw_start, end_date) if raw_start <= end_date else None
+    rollup_end = min(end_date, cutoff - datetime.timedelta(days=1))
+    rollup_range = (start_date, rollup_end) if start_date <= rollup_end else None
+    return raw_range, rollup_range
+
+
+def _combine(a: _DevStats, b: _DevStats) -> _DevStats:
+    sample_count = a.sample_count + b.sample_count
+    if sample_count == 0:
+        return _DevStats()
+    weighted_delay_sum = 0.0
+    weight = 0
+    for stats in (a, b):
+        if stats.avg_delay is not None and stats.sample_count:
+            weighted_delay_sum += stats.avg_delay * stats.sample_count
+            weight += stats.sample_count
+    avg_delay = (weighted_delay_sum / weight) if weight else None
+    return _DevStats(sample_count=sample_count, avg_delay=avg_delay, on_time_count=a.on_time_count + b.on_time_count)
+
+
+def _rollup_route_stats(
+    session: Session, route_id: str, start_date: datetime.date, end_date: datetime.date
+) -> _DevStats:
+    """Aggregate daily_route_stats rows for one route over a date range.
+    Route-level only - see module docstring for why a segment/stop lookup
+    can't get a more precise historical figure than this.
+    """
+    query = select(
+        func.sum(DailyRouteStat.sample_count).label("sample_count"),
+        func.sum(DailyRouteStat.avg_delay_seconds * DailyRouteStat.sample_count).label("weighted_delay"),
+        func.sum(DailyRouteStat.on_time_pct * DailyRouteStat.sample_count / 100).label("on_time_count"),
+    ).where(
+        DailyRouteStat.route_id == route_id,
+        DailyRouteStat.service_date >= start_date,
+        DailyRouteStat.service_date <= end_date,
+    )
+    sample_count, weighted_delay, on_time_count = session.execute(query).one()
+    sample_count = sample_count or 0
+    if not sample_count:
+        return _DevStats()
+    avg_delay = (weighted_delay / sample_count) if weighted_delay is not None else None
+    return _DevStats(sample_count=sample_count, avg_delay=avg_delay, on_time_count=float(on_time_count or 0))
+
+
+def _rollup_route_stats_by_route(
+    session: Session, route_ids: list[str], start_date: datetime.date, end_date: datetime.date
+) -> dict[str, _DevStats]:
+    if not route_ids:
+        return {}
+    query = (
+        select(
+            DailyRouteStat.route_id,
+            func.sum(DailyRouteStat.sample_count).label("sample_count"),
+            func.sum(DailyRouteStat.avg_delay_seconds * DailyRouteStat.sample_count).label("weighted_delay"),
+            func.sum(DailyRouteStat.on_time_pct * DailyRouteStat.sample_count / 100).label("on_time_count"),
+        )
+        .where(
+            DailyRouteStat.route_id.in_(route_ids),
+            DailyRouteStat.service_date >= start_date,
+            DailyRouteStat.service_date <= end_date,
+        )
+        .group_by(DailyRouteStat.route_id)
+    )
+    result = {}
+    for route_id, sample_count, weighted_delay, on_time_count in session.execute(query):
+        sample_count = sample_count or 0
+        if not sample_count:
+            continue
+        avg_delay = (weighted_delay / sample_count) if weighted_delay is not None else None
+        result[route_id] = _DevStats(sample_count=sample_count, avg_delay=avg_delay, on_time_count=float(on_time_count or 0))
+    return result
 
 
 @dataclass
@@ -133,25 +239,43 @@ def compute_segment_reliability(
 
     stop_ids = _segment_stop_ids(session, segment.reference_trip_id, segment.start_seq, segment.end_seq)
 
-    dev_query = (
-        select(
-            func.count().label("sample_count"),
-            func.avg(ScheduleDeviation.delay_seconds).label("avg_delay"),
-            func.sum(_on_time_case()).label("on_time_count"),
+    raw_range, rollup_range = _split_range(start_date, end_date)
+
+    raw_stats = _DevStats()
+    if raw_range is not None:
+        raw_start, raw_end = raw_range
+        dev_query = (
+            select(
+                func.count().label("sample_count"),
+                func.avg(ScheduleDeviation.delay_seconds).label("avg_delay"),
+                func.sum(_on_time_case()).label("on_time_count"),
+            )
+            .select_from(ScheduleDeviation)
+            .join(Trip, Trip.trip_id == ScheduleDeviation.trip_id)
+            .where(
+                ScheduleDeviation.route_id == route_id,
+                Trip.direction_id == segment.direction_id,
+                ScheduleDeviation.stop_id == end_stop_id,
+                ScheduleDeviation.event_type == "arrival",
+                ScheduleDeviation.service_date >= raw_start,
+                ScheduleDeviation.service_date <= raw_end,
+            )
         )
-        .select_from(ScheduleDeviation)
-        .join(Trip, Trip.trip_id == ScheduleDeviation.trip_id)
-        .where(
-            ScheduleDeviation.route_id == route_id,
-            Trip.direction_id == segment.direction_id,
-            ScheduleDeviation.stop_id == end_stop_id,
-            ScheduleDeviation.event_type == "arrival",
-            ScheduleDeviation.service_date >= start_date,
-            ScheduleDeviation.service_date <= end_date,
+        raw_count, raw_avg_delay, raw_on_time_count = session.execute(dev_query).one()
+        raw_stats = _DevStats(
+            sample_count=raw_count or 0,
+            avg_delay=float(raw_avg_delay) if raw_avg_delay is not None else None,
+            on_time_count=float(raw_on_time_count or 0),
         )
-    )
-    sample_count, avg_delay, on_time_count = session.execute(dev_query).one()
-    sample_count = sample_count or 0
+
+    rollup_stats = _DevStats()
+    if rollup_range is not None:
+        rollup_stats = _rollup_route_stats(session, route_id, rollup_range[0], rollup_range[1])
+
+    combined = _combine(raw_stats, rollup_stats)
+    sample_count = combined.sample_count
+    avg_delay = combined.avg_delay
+    on_time_count = combined.on_time_count
 
     start_dt = datetime.datetime.combine(start_date, datetime.time.min, tzinfo=datetime.timezone.utc)
     end_dt = datetime.datetime.combine(end_date, datetime.time.max, tzinfo=datetime.timezone.utc)
@@ -203,35 +327,55 @@ def compute_group_reliability(
 
     group_col = ScheduleDeviation.route_id if group_by == "route" else ScheduleDeviation.stop_id
 
-    query = (
-        select(
-            group_col.label("key"),
-            func.count().label("sample_count"),
-            func.avg(ScheduleDeviation.delay_seconds).label("avg_delay"),
-            func.sum(_on_time_case()).label("on_time_count"),
-        )
-        .where(
-            ScheduleDeviation.event_type == "arrival",
-            ScheduleDeviation.service_date >= start_date,
-            ScheduleDeviation.service_date <= end_date,
-        )
-        .group_by(group_col)
-        .having(func.count() >= min_samples)
-    )
-    if route_id is not None:
-        query = query.where(ScheduleDeviation.route_id == route_id)
+    raw_range, rollup_range = _split_range(start_date, end_date)
 
-    rows = session.execute(query).all()
-    if not rows:
+    stats_by_key: dict[str, _DevStats] = {}
+    if raw_range is not None:
+        raw_start, raw_end = raw_range
+        raw_query = (
+            select(
+                group_col.label("key"),
+                func.count().label("sample_count"),
+                func.avg(ScheduleDeviation.delay_seconds).label("avg_delay"),
+                func.sum(_on_time_case()).label("on_time_count"),
+            )
+            .where(
+                ScheduleDeviation.event_type == "arrival",
+                ScheduleDeviation.service_date >= raw_start,
+                ScheduleDeviation.service_date <= raw_end,
+            )
+            .group_by(group_col)
+        )
+        if route_id is not None:
+            raw_query = raw_query.where(ScheduleDeviation.route_id == route_id)
+        for key, sample_count, avg_delay, on_time_count in session.execute(raw_query):
+            stats_by_key[key] = _DevStats(
+                sample_count=sample_count or 0,
+                avg_delay=float(avg_delay) if avg_delay is not None else None,
+                on_time_count=float(on_time_count or 0),
+            )
+
+    # daily_route_stats has no per-stop breakdown, so the rollup portion of
+    # the range can only extend a route-scoped ranking, not a stop-scoped one.
+    if rollup_range is not None and group_by == "route":
+        rollup_query = select(DailyRouteStat.route_id).where(
+            DailyRouteStat.service_date >= rollup_range[0], DailyRouteStat.service_date <= rollup_range[1]
+        )
+        if route_id is not None:
+            rollup_query = rollup_query.where(DailyRouteStat.route_id == route_id)
+        candidate_route_ids = sorted({r for (r,) in session.execute(rollup_query)} | set(stats_by_key))
+        rollup_stats = _rollup_route_stats_by_route(session, candidate_route_ids, rollup_range[0], rollup_range[1])
+        for key, r_stats in rollup_stats.items():
+            stats_by_key[key] = _combine(stats_by_key.get(key, _DevStats()), r_stats)
+
+    stats_by_key = {key: stats for key, stats in stats_by_key.items() if stats.sample_count >= min_samples}
+    if not stats_by_key:
         return []
 
-    on_time_pct_by_key = {}
-    stats_by_key = {}
-    for key, sample_count, avg_delay, on_time_count in rows:
-        pct = (on_time_count / sample_count * 100) if sample_count else 0.0
-        on_time_pct_by_key[key] = pct
-        stats_by_key[key] = (sample_count, avg_delay, on_time_count)
-
+    on_time_pct_by_key = {
+        key: (stats.on_time_count / stats.sample_count * 100) if stats.sample_count else 0.0
+        for key, stats in stats_by_key.items()
+    }
     worst_keys = sorted(on_time_pct_by_key, key=lambda k: on_time_pct_by_key[k])[:limit]
 
     start_dt = datetime.datetime.combine(start_date, datetime.time.min, tzinfo=datetime.timezone.utc)
@@ -242,7 +386,7 @@ def compute_group_reliability(
     if group_by == "route":
         routes = {r.route_id: r for r in session.query(Route).filter(Route.route_id.in_(worst_keys)).all()}
         for key in worst_keys:
-            sample_count, avg_delay, on_time_count = stats_by_key[key]
+            sample_count, avg_delay = stats_by_key[key].sample_count, stats_by_key[key].avg_delay
             route = routes.get(key)
             bunching_count = _bunching_count(session, key, start_dt, end_dt)
             results.append(
@@ -266,7 +410,7 @@ def compute_group_reliability(
         # Bunching events aren't naturally per-stop across arbitrary routes,
         # so bunching_event_count is omitted (left at 0) for stop-scoped rows.
         for key in worst_keys:
-            sample_count, avg_delay, on_time_count = stats_by_key[key]
+            sample_count, avg_delay = stats_by_key[key].sample_count, stats_by_key[key].avg_delay
             stop = stops.get(key)
             results.append(
                 ReliabilityStats(

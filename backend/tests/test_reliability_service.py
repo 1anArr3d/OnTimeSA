@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import settings
 from app.db import Base
-from app.models import BunchingEvent, Calendar, Route, ScheduleDeviation, Stop, StopTime, Trip
+from app.models import BunchingEvent, Calendar, DailyRouteStat, Route, ScheduleDeviation, Stop, StopTime, Trip
 from app.reliability_service import compute_group_reliability, compute_segment_reliability
 
 IN_RANGE_DATE = datetime.date(2026, 7, 1)
@@ -22,6 +22,16 @@ def session():
     Base.metadata.create_all(engine)
     with Session(engine) as s:
         yield s
+
+
+@pytest.fixture(autouse=True)
+def _wide_raw_retention(monkeypatch):
+    # These tests seed fixed historical service_dates that predate the real
+    # 5-day raw retention window (see app/rollup_service.py). Widen it here
+    # so these tests exercise the plain raw-data path they were written for;
+    # the raw/rollup split itself is covered separately by the
+    # "*_blends_raw_and_rollup" tests below, which set retention back down.
+    monkeypatch.setattr(settings, "raw_data_retention_days", 5000)
 
 
 def _seed_calendar(session):
@@ -226,3 +236,68 @@ def test_group_reliability_stop_scope(session):
     results = compute_group_reliability(session, START_DATE, END_DATE, group_by="stop", limit=10)
     assert results[0].end_stop_id == "STOP_B"
     assert results[0].scope == "stop"
+
+
+def test_segment_reliability_blends_raw_and_rollup(session, monkeypatch):
+    # Real 5-day retention: raw covers today-4..today, anything older must
+    # come from daily_route_stats instead.
+    monkeypatch.setattr(settings, "raw_data_retention_days", 5)
+    today = datetime.date.today()
+
+    _seed_calendar(session)
+    _seed_route(session, "R1", "1")
+    _seed_stop(session, "A", "Start")
+    _seed_stop(session, "B", "End")
+    _seed_trip(session, "T1", "R1", 0, [(1, "A", 28800), (2, "B", 29100)])
+    session.flush()
+
+    # 3 raw samples inside the retention window.
+    for i, delay in enumerate((0, 30, 60)):
+        _add_deviation(session, "T1", "R1", "B", delay_seconds=delay, service_date=today - datetime.timedelta(days=i))
+    # A rollup row for a day well outside the retention window - no raw rows
+    # for it, only the rolled-up summary.
+    old_date = today - datetime.timedelta(days=30)
+    session.add(
+        DailyRouteStat(
+            route_id="R1", service_date=old_date, on_time_pct=50.0, avg_delay_seconds=120.0,
+            bunching_event_count=0, sample_count=10,
+        )
+    )
+    session.commit()
+
+    result = compute_segment_reliability(session, "R1", "A", "B", old_date, today)
+
+    assert result.sample_count == 13  # 3 raw + 10 rolled-up
+    # weighted avg: (0+30+60 + 120*10) / 13
+    assert result.avg_delay_seconds == pytest.approx((0 + 30 + 60 + 120 * 10) / 13)
+    # on-time count: 3 raw on-time (all within threshold) + 5 rolled-up (50% of 10)
+    assert result.on_time_pct == pytest.approx((3 + 5) / 13 * 100)
+    assert result.confidence == "low"  # 13 < min_reliable_sample_count (20)
+
+
+def test_group_reliability_route_scope_blends_raw_and_rollup(session, monkeypatch):
+    monkeypatch.setattr(settings, "raw_data_retention_days", 5)
+    today = datetime.date.today()
+
+    _seed_calendar(session)
+    _seed_route(session, "R1", "1")
+    _seed_stop(session, "S1")
+    _seed_trip(session, "T1", "R1", 0, [(1, "S1", 28800)])
+    session.flush()
+
+    for i in range(3):
+        _add_deviation(session, "T1", "R1", "S1", delay_seconds=0, service_date=today - datetime.timedelta(days=i))
+    old_date = today - datetime.timedelta(days=30)
+    session.add(
+        DailyRouteStat(
+            route_id="R1", service_date=old_date, on_time_pct=100.0, avg_delay_seconds=0.0,
+            bunching_event_count=0, sample_count=20,
+        )
+    )
+    session.commit()
+
+    results = compute_group_reliability(session, old_date, today, group_by="route", limit=10, min_samples=20)
+    assert len(results) == 1
+    assert results[0].route_id == "R1"
+    assert results[0].sample_count == 23  # 3 raw + 20 rolled-up
+    assert results[0].confidence == "high"

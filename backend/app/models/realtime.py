@@ -108,6 +108,32 @@ class BunchingEvent(Base):
     )
 
 
+class DailyRouteStat(Base):
+    """One row per (route, service_date) rollup of that day's schedule_deviations
+    and bunching_events, computed once by the nightly rollup job.
+
+    Exists so reliability queries reaching further back than
+    settings.raw_data_retention_days can still answer without the raw rows -
+    see app/rollup_service.py. sample_count is carried through so the same
+    low-confidence-flag convention used elsewhere (settings.min_reliable_sample_count)
+    still applies to rollup-sourced results.
+    """
+
+    __tablename__ = "daily_route_stats"
+    __table_args__ = (UniqueConstraint("route_id", "service_date", name="uq_daily_route_stat_route_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    route_id: Mapped[str] = mapped_column(ForeignKey("routes.route_id"), index=True)
+    service_date: Mapped[datetime.date] = mapped_column(Date, index=True)
+    on_time_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_delay_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bunching_event_count: Mapped[int] = mapped_column(Integer, default=0)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    computed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc)
+    )
+
+
 class HeadwaySample(Base):
     """Every consecutive-vehicle-pair headway comparison computed during
     bunching detection, whether or not it crossed the bunching threshold.

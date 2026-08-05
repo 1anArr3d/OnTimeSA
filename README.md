@@ -1,4 +1,4 @@
-# SA Transit Pulse
+# OnTimeSA
 
 A reliability-tracking dashboard for VIA Metropolitan Transit's (San Antonio) bus
 network: live vehicle positions, historical on-time performance by route/stop,
@@ -53,6 +53,11 @@ frontend/   React + TypeScript + Vite
 - **`bunching_events`** - the subset of headway samples that crossed the
   threshold, merged across polls into a single ongoing event rather than
   duplicated every cycle.
+- **`daily_route_stats`** - one row per (route, service_date), computed
+  nightly from that day's `schedule_deviations`/`bunching_events` before
+  those raw rows age out of the 5-day retention window. Reliability queries
+  fall back to this table for any part of a requested date range older than
+  the retention window - see the storage-cap changelog entry below.
 
 ## Setup
 
@@ -124,9 +129,10 @@ intra-day): re-run the same two-line loader snippet from setup above (fetch +
 `load_static_feed`) on a cron/scheduled task. It's a safe upsert, not a
 destructive reload.
 
-**GTFS-RT polling** (every 30-60s, this project defaults to 45s via
-`SATP_GTFS_RT_POLL_SECONDS`): this is what populates vehicle positions,
-schedule deviations, and bunching detection. Two ways to run it:
+**GTFS-RT polling** (this project defaults to 120s via
+`SATP_GTFS_RT_POLL_SECONDS` - see the storage-cap changelog entry below for
+why): this is what populates vehicle positions, schedule deviations, and
+bunching detection. Two ways to run it:
 
 ```bash
 # Option A: built-in APScheduler loop, blocks forever
@@ -140,6 +146,12 @@ python -m app.poller
 Prefer option B (external scheduler) for anything long-running in production -
 it survives a poll cycle hanging or crashing without taking the whole process
 down, which `run_scheduler()`'s in-process loop won't.
+
+**Daily rollup + pruning** (00:10 America/Chicago, also via `run_scheduler()`
+or callable directly as `app.rollup_service.run_daily_maintenance()`): rolls
+yesterday's raw data into `daily_route_stats`, then prunes raw rows older
+than `SATP_RAW_DATA_RETENTION_DAYS` (default 5). See the changelog entry
+below for why this exists.
 
 **A note on data freshness:** the Dashboard only reflects however long the
 poller has actually been running continuously. A fresh deployment that's only
@@ -166,6 +178,50 @@ throughout, value stable, and total table growth dropped from ~17,000
 new rows/poll to ~40. The pre-fix table (638K redundant rows) was truncated
 as part of this fix - no real historical signal was lost, since none of those
 rows represented data older than a few hours.
+
+### Changelog: rollup + pruning for Neon free-tier storage cap (2026-08-04)
+
+Modeled raw time-series growth (`vehicle_position_snapshots` +
+`schedule_deviations`) against Neon's free-tier 500 MB cap and found
+keeping raw data forever wasn't sustainable - at the original 45s poll
+interval those two tables alone were growing ~30 MB/day (measured directly:
+39 MB + 22 MB over ~46 hours of real polling), which would exhaust the cap
+within days. Implemented the standard time-series fix rather than raw
+retention:
+
+- **Poll interval 45s -> 120s** (`SATP_GTFS_RT_POLL_SECONDS`) - a ~2.7x
+  reduction in raw write rate, still frequent enough to catch bunching
+  events, which in every real event detected so far played out over
+  multiple minutes.
+- **`daily_route_stats`** - one row per route per service day
+  (`on_time_pct`, `avg_delay_seconds`, `bunching_event_count`,
+  `sample_count`), computed by a nightly job (00:10 America/Chicago) from
+  that day's raw rows.
+- **5-day raw retention** - a nightly job bulk-deletes
+  `vehicle_position_snapshots`/`schedule_deviations` rows older than 5 days.
+  `headway_samples` and `bunching_events` are never pruned - low-volume and
+  the actual event log, respectively. The rollup job always runs before the
+  prune job (same nightly cycle, rollup first), so a day is never pruned
+  before it's been rolled up.
+- **Reliability queries now blend both** - `/api/reliability/segment` and
+  `/api/reliability/worst-offenders` query raw data directly for the last 5
+  days and fall back to `daily_route_stats` for anything older, combining
+  sample counts/weighted averages across the split so the existing
+  confidence-flag behavior carries through unchanged either way.
+
+Verified against the real Neon instance: rolled up a real day (88 routes)
+and cross-checked one route's rollup row against a direct raw aggregation
+query (sample count, avg delay, and on-time % matched exactly); confirmed
+`/api/reliability/worst-offenders` returns identical numbers whether queried
+over a 2-day window (raw-only path) or a 35-day window spanning into the
+rollup range (blended path), since there was no older data yet for the
+rollup portion to add; confirmed the prune job deletes 0 rows when nothing
+is actually older than the retention window. Current table sizes (`\dt+`
+equivalent): `stop_times` (static schedule) is actually the single largest
+table at 146 MB, well ahead of either time-series table - the raw+rollup
+fix caps the part of storage that grows unboundedly over time, not the
+static schedule data, which is upserted in place and doesn't grow with
+uptime.
 
 ## Roadmap (explicitly out of scope for this version)
 
