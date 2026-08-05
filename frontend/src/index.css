@@ -10,6 +10,7 @@
   --border: rgba(11, 11, 11, 0.1);
 
   --series-1: #2a78d6; /* sequential blue - magnitude comparisons */
+  --route-line: #4a3aa7; /* violet - distinct from blue stops and every vehicle status color */
 
   --status-good: #0ca30c;
   --status-warning: #fab219;
@@ -33,6 +34,7 @@
     --border: rgba(255, 255, 255, 0.1);
 
     --series-1: #3987e5;
+    --route-line: #9085e9;
   }
 }
 
@@ -48,6 +50,7 @@
   --border: rgba(255, 255, 255, 0.1);
 
   --series-1: #3987e5;
+  --series-8: #e66767;
 }
 
 * {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import L from "leaflet";
-import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet";
+import { CircleMarker, MapContainer, Marker, Pane, Polyline, Popup, TileLayer } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import { api } from "../api/client";
 import type { LiveVehicle, RouteShapeDirection, RouteSummary, StopSummary } from "../api/types";
@@ -13,21 +13,51 @@ const POLL_INTERVAL_MS = 30_000;
 const LEGEND_ITEMS: Array<keyof typeof DELAY_STATUS_LABEL> = ["on_time", "late", "very_late", "early", "unknown"];
 
 /**
- * Directional chevron when we know which way the vehicle is heading
- * (GTFS-RT bearing, degrees clockwise from north - matches CSS rotate()
- * directly). Falls back to a plain dot when bearing is unknown rather than
- * pointing an arrow in a fabricated direction.
+ * Icon shape reflects GTFS-RT current_status, not just whether bearing
+ * happens to be present (a stopped vehicle still reports its last heading,
+ * so "has a bearing" isn't a reliable stand-in for "is moving"):
+ * - STOPPED_AT: circle - vehicle is stationary at a stop, no direction to show.
+ * - IN_TRANSIT_TO / INCOMING_AT (or unrecognized): directional chevron
+ *   rotated to bearing when known, falling back to a plain circle only if
+ *   bearing itself is missing.
+ *
+ * "Unknown" vehicles (no active trip - e.g. hundreds of buses parked at the
+ * overnight depot, which VIA's feed reports at nearly identical
+ * coordinates) get a much smaller, low-opacity dot with no stroke/shadow.
+ * At full size, a dense cluster of these compounds into a solid dark blob
+ * (overlapping dark outlines + drop-shadows stacking) - since these carry
+ * zero route/delay signal anyway, de-emphasizing them fixes the blob
+ * without needing full marker clustering.
  */
-function createVehicleIcon(color: string, bearing: number | null): L.DivIcon {
+function createVehicleIcon(
+  color: string,
+  bearing: number | null,
+  isUnknown: boolean,
+  currentStatus: string | null
+): L.DivIcon {
+  if (isUnknown) {
+    return L.divIcon({
+      html: `<svg width="9" height="9" viewBox="0 0 9 9"><circle cx="4.5" cy="4.5" r="3.5" fill="${color}" fill-opacity="0.6" /></svg>`,
+      className: "vehicle-icon",
+      iconSize: [9, 9],
+      iconAnchor: [4.5, 4.5],
+    });
+  }
+
   const hasHeading = bearing !== null && bearing !== undefined;
-  const html = hasHeading
-    ? `<svg width="22" height="22" viewBox="0 0 22 22" style="transform: rotate(${bearing}deg)">
-         <polygon points="11,2 18,18 11,14 4,18" fill="${color}" stroke="white" stroke-width="1.5" stroke-linejoin="round" />
+  const isStopped = currentStatus === "STOPPED_AT";
+  const showChevron = !isStopped && hasHeading;
+  // A lighter, thinner stroke than pure black/white - enough contrast
+  // against OSM's pale basemap without the heavier version's shadow-stacking
+  // blob effect when several markers overlap.
+  const html = showChevron
+    ? `<svg width="24" height="24" viewBox="0 0 24 24" style="transform: rotate(${bearing}deg)">
+         <polygon points="12,3 19,20 12,16 5,20" fill="${color}" stroke="#4a4a4a" stroke-width="1" stroke-linejoin="round" />
        </svg>`
-    : `<svg width="16" height="16" viewBox="0 0 16 16">
-         <circle cx="8" cy="8" r="6" fill="${color}" stroke="white" stroke-width="2" />
+    : `<svg width="18" height="18" viewBox="0 0 18 18">
+         <circle cx="9" cy="9" r="6.5" fill="${color}" stroke="#4a4a4a" stroke-width="1.25" />
        </svg>`;
-  const size = hasHeading ? 22 : 16;
+  const size = showChevron ? 24 : 18;
   return L.divIcon({
     html,
     className: "vehicle-icon",
@@ -137,13 +167,20 @@ export function LiveMap() {
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
-        {routeShapes.map((shape) => (
-          <Polyline
-            key={shape.direction_id}
-            positions={shape.points.map((p) => [p.lat, p.lon] as [number, number])}
-            pathOptions={{ color: "var(--series-1)", weight: 3, opacity: 0.6 }}
-          />
-        ))}
+        {/* Dedicated pane with a lower z-index than the default overlayPane
+            (400) that stop/vehicle markers render in - stops and shape load
+            via two independent async fetches, so whichever resolves later
+            would otherwise paint on top regardless of JSX order. A pane
+            guarantees stacking order independent of fetch timing. */}
+        <Pane name="route-line" style={{ zIndex: 350 }}>
+          {routeShapes.map((shape) => (
+            <Polyline
+              key={shape.direction_id}
+              positions={shape.points.map((p) => [p.lat, p.lon] as [number, number])}
+              pathOptions={{ color: "var(--route-line)", weight: 5, opacity: 0.9 }}
+            />
+          ))}
+        </Pane>
 
         {uniqueRouteStops.map(
           (s) =>
@@ -152,8 +189,8 @@ export function LiveMap() {
               <CircleMarker
                 key={s.stop_id}
                 center={[s.stop_lat, s.stop_lon]}
-                radius={4}
-                pathOptions={{ color: "#fff", fillColor: "var(--series-1)", fillOpacity: 1, weight: 1.5 }}
+                radius={5}
+                pathOptions={{ color: "#fff", fillColor: "var(--series-1)", fillOpacity: 1, weight: 2 }}
               >
                 <Popup>
                   <div style={{ fontSize: 13 }}>{s.stop_name}</div>
@@ -169,7 +206,7 @@ export function LiveMap() {
             <Marker
               key={v.vehicle_id}
               position={[v.latitude as number, v.longitude as number]}
-              icon={createVehicleIcon(color, v.bearing)}
+              icon={createVehicleIcon(color, v.bearing, status === "unknown", v.current_status)}
               eventHandlers={
                 v.route_id
                   ? {
@@ -241,6 +278,67 @@ export function LiveMap() {
         ))}
         <div style={{ marginTop: 8, color: "var(--text-muted)" }}>
           {positioned.length} vehicles{lastUpdated && <> · updated {lastUpdated.toLocaleTimeString()}</>}
+        </div>
+      </div>
+
+      <div
+        className="card"
+        style={{
+          position: "absolute",
+          top: 232,
+          right: 16,
+          zIndex: 1000,
+          fontSize: 12,
+          minWidth: 160,
+          maxWidth: 220,
+          color: "var(--text-muted)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" style={{ flexShrink: 0 }}>
+            <polygon points="12,3 19,20 12,16 5,20" fill="#888" stroke="#4a4a4a" strokeWidth="1" strokeLinejoin="round" />
+          </svg>
+          <span>Chevron, pointing the way it's heading - in transit / approaching a stop</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <svg width="13" height="13" viewBox="0 0 18 18" style={{ flexShrink: 0 }}>
+            <circle cx="9" cy="9" r="6.5" fill="#888" stroke="#4a4a4a" strokeWidth="1.25" />
+          </svg>
+          <span>Circle - stopped at a stop right now</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+          <svg width="9" height="9" viewBox="0 0 9 9" style={{ flexShrink: 0 }}>
+            <circle cx="4.5" cy="4.5" r="3.5" fill="#888" fillOpacity="0.6" />
+          </svg>
+          <span>Small dot - no active trip (e.g. parked overnight)</span>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <span
+            style={{
+              width: 16,
+              height: 3,
+              borderRadius: 2,
+              background: "var(--route-line)",
+              display: "inline-block",
+              flexShrink: 0,
+            }}
+          />
+          <span>Route shape - the road path a selected route's vehicles actually follow, from VIA's published schedule (not a live GPS trace)</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: "50%",
+              background: "var(--series-1)",
+              border: "2px solid #fff",
+              display: "inline-block",
+              flexShrink: 0,
+            }}
+          />
+          <span>Stops along the selected route</span>
         </div>
       </div>
 
