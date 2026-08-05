@@ -39,6 +39,32 @@ def poll_once(session: Session) -> dict:
     trip_updates = fetch_trip_updates()
     logger.info("Polled %d vehicle positions, %d trip update stop-times", len(vehicle_positions), len(trip_updates))
 
+    # Nothing to persist: no vehicle is on an active trip, and TripUpdates has
+    # nothing either - this is either the ~2-hour real overnight gap (checked
+    # against the static schedule: every service day has a genuine window
+    # with zero scheduled trips) or a feed outage. Either way there's nothing
+    # to write, so return before touching `session` at all rather than after -
+    # SQLAlchemy's Session doesn't open a real Postgres connection until the
+    # first query/execute, so skipping that first touch here means Neon sees
+    # no connection this cycle at all, not just an empty transaction. This
+    # also can't be confused with "sleep because we assume service ended":
+    # it re-checks the real feed every cycle (still on the normal interval),
+    # so a feed outage during genuine service hours or an earlier-than-
+    # expected resumption both self-correct on the very next poll instead of
+    # depending on a predicted schedule.
+    if not any(vp["trip_id"] for vp in vehicle_positions) and not trip_updates:
+        logger.info("No active trips this cycle - skipping the database entirely so Neon can idle.")
+        return {
+            "polled_at": poll_time.isoformat(),
+            "vehicle_positions": len(vehicle_positions),
+            "trip_update_stop_times": len(trip_updates),
+            "deviations_from_trip_updates": 0,
+            "deviations_from_vehicle_positions": 0,
+            "headway_samples": 0,
+            "new_bunching_events": 0,
+            "skipped_db": True,
+        }
+
     # Load each active trip's static schedule context ONCE for the union of
     # every trip_id any of the three consumers below might need, instead of
     # each independently re-querying Postgres for its own heavily-overlapping

@@ -223,6 +223,43 @@ fix caps the part of storage that grows unboundedly over time, not the
 static schedule data, which is upserted in place and doesn't grow with
 uptime.
 
+### Changelog: skip the database entirely on empty overnight poll cycles (2026-08-05)
+
+Queried the real static schedule rather than assuming fixed hours: every
+service day (weekday, Saturday, Sunday all checked separately) has a
+genuine ~2-hour window with zero scheduled trips (e.g. weekdays 1:56 AM -
+3:42 AM America/Chicago) - verified directly against `stop_times`, not just
+inferred from `calendar.txt`'s min/max. The poller was still polling and
+writing every 120s through that window purely to record ~400 parked/off-
+service vehicles nobody reads history for, which also meant Neon's compute
+(idles after 5 min with no connections) never got the chance to scale to
+zero.
+
+Fixed by checking each poll's *own* fetched data, not a predicted schedule:
+if zero vehicles have an active `trip_id` and TripUpdates is empty,
+`poll_once()` returns before ever touching the database session - not just
+skipping writes, skipping the connection itself, since SQLAlchemy doesn't
+open one until the first query. Deliberately not the "predict next
+departure from the static schedule and sleep until then" design considered
+initially - that requires trusting the static schedule's timing exactly
+right (this project doesn't even ingest `calendar_dates.txt`, so it has no
+way to know about schedule exceptions in advance) and risks sleeping through
+an earlier-than-expected resumption. Checking the real feed every cycle
+instead means a feed outage during genuine service hours and an early
+resumption both self-correct on the very next poll rather than depending on
+a prediction.
+
+Verified against the real system: confirmed via SQLAlchemy connection-pool
+events that an empty-feed poll checks out zero Postgres connections (a
+normal poll checks out one, confirming the instrumentation itself is
+valid); confirmed a poll with off-service vehicles present but zero active
+trips still skips correctly; confirmed a poll with vehicles empty but
+TripUpdates non-empty correctly does *not* skip; ran a skipped cycle
+immediately followed by a real one (service happened to resume mid-
+verification) and got a clean 4,018-deviation write with no stale state.
+The nightly rollup/prune job is on its own independent APScheduler cron
+trigger and was untouched.
+
 ## Roadmap (explicitly out of scope for this version)
 
 These were deliberately not built, to keep this version's scope to reliability
@@ -239,6 +276,13 @@ tracking rather than trip planning:
   those, not a competitor.
 - **Causal analysis of delays** (weather, traffic signals, etc.) - this
   version reports GTFS-RT-vs-schedule comparisons only, no causal claims.
+- **`calendar_dates.txt` (service exceptions) is not ingested** - only
+  `calendar.txt`'s recurring weekly pattern is parsed (`app/gtfs/static.py`,
+  `app/models/gtfs_static.py`). Holiday closures, single-day added/removed
+  service, and other calendar exceptions VIA might publish aren't reflected
+  anywhere in this system - the static schedule refresh would only catch a
+  service change if VIA republishes `calendar.txt`/`trips.txt` outright, not
+  a targeted exception. Known gap, not fixed yet.
 
 ## Notable finding
 
