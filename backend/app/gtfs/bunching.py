@@ -76,6 +76,7 @@ def detect_bunching(
     trip_delays: dict[str, float],
     poll_time: datetime.datetime,
     trip_context: dict | None = None,
+    recent_events: list[BunchingEvent] | None = None,
 ) -> tuple[list[HeadwaySample], list[BunchingEvent]]:
     """Compare consecutive vehicles per (route, direction) and return the raw
     headway samples plus any newly created/extended bunching events.
@@ -83,6 +84,15 @@ def detect_bunching(
     trip_context can be pre-loaded once and shared with the deviation
     calculations - see compute_deviations_from_trip_updates()'s docstring
     in app/gtfs/deviation.py.
+
+    recent_events, if given, is searched in Python for an ongoing event to
+    extend instead of querying `session` for one - see app/live_state.py's
+    docstring for why (an in-memory buffer flushed only hourly means an
+    event's DB row may not exist yet, or may already be flushed and need an
+    UPDATE rather than a fresh INSERT on the next flush). Any event this
+    function creates or extends gets `_dirty = True` set on it (a plain
+    Python attribute, not a DB column) so the flush step downstream knows
+    which of the events it's holding actually need writing.
     """
     threshold_seconds = settings.bunching_headway_threshold_minutes * 60
     min_scheduled_headway_seconds = settings.bunching_min_scheduled_headway_minutes * 60
@@ -156,17 +166,28 @@ def detect_bunching(
             if not crossed_threshold:
                 continue
 
-            existing = (
-                session.query(BunchingEvent)
-                .filter(
-                    BunchingEvent.route_id == route_id,
-                    BunchingEvent.lead_trip_id == lead["trip_id"],
-                    BunchingEvent.follow_trip_id == follow["trip_id"],
-                    BunchingEvent.end_time >= poll_time - merge_window,
+            if recent_events is not None:
+                candidates_for_key = [
+                    e
+                    for e in recent_events
+                    if e.route_id == route_id
+                    and e.lead_trip_id == lead["trip_id"]
+                    and e.follow_trip_id == follow["trip_id"]
+                    and e.end_time >= poll_time - merge_window
+                ]
+                existing = max(candidates_for_key, key=lambda e: e.end_time, default=None)
+            else:
+                existing = (
+                    session.query(BunchingEvent)
+                    .filter(
+                        BunchingEvent.route_id == route_id,
+                        BunchingEvent.lead_trip_id == lead["trip_id"],
+                        BunchingEvent.follow_trip_id == follow["trip_id"],
+                        BunchingEvent.end_time >= poll_time - merge_window,
+                    )
+                    .order_by(BunchingEvent.end_time.desc())
+                    .first()
                 )
-                .order_by(BunchingEvent.end_time.desc())
-                .first()
-            )
             severity = _severity(max(observed_headway, 0), threshold_seconds)
             if existing:
                 existing.end_time = poll_time
@@ -174,23 +195,24 @@ def detect_bunching(
                 existing.location_lon = follow["longitude"]
                 existing.observed_headway_seconds = observed_headway
                 existing.severity = severity
+                existing._dirty = True
             else:
-                bunching_events.append(
-                    BunchingEvent(
-                        route_id=route_id,
-                        direction_id=direction_id,
-                        start_time=poll_time,
-                        end_time=poll_time,
-                        location_lat=follow["latitude"],
-                        location_lon=follow["longitude"],
-                        nearest_stop_id=follow["stop_id"],
-                        lead_trip_id=lead["trip_id"],
-                        follow_trip_id=follow["trip_id"],
-                        vehicle_ids=[lead["vehicle_id"], follow["vehicle_id"]],
-                        observed_headway_seconds=observed_headway,
-                        scheduled_headway_seconds=scheduled_headway,
-                        severity=severity,
-                    )
+                new_event = BunchingEvent(
+                    route_id=route_id,
+                    direction_id=direction_id,
+                    start_time=poll_time,
+                    end_time=poll_time,
+                    location_lat=follow["latitude"],
+                    location_lon=follow["longitude"],
+                    nearest_stop_id=follow["stop_id"],
+                    lead_trip_id=lead["trip_id"],
+                    follow_trip_id=follow["trip_id"],
+                    vehicle_ids=[lead["vehicle_id"], follow["vehicle_id"]],
+                    observed_headway_seconds=observed_headway,
+                    scheduled_headway_seconds=scheduled_headway,
+                    severity=severity,
                 )
+                new_event._dirty = True
+                bunching_events.append(new_event)
 
     return headway_samples, bunching_events

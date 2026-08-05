@@ -1,8 +1,17 @@
 """One GTFS-RT poll cycle: fetch both feeds, persist raw vehicle position
 history, compute schedule deviations, run bunching detection, commit.
 
-Intended to be called on a schedule (see run_scheduler() using APScheduler,
-or `python -m app.poller` for a single one-off run during development).
+Two modes:
+- poll_once() / run_scheduler(): the original DB-per-poll design. Kept for
+  manual one-off polls (`python -m app.poller`) and as a reference
+  implementation; no longer used in production.
+- poll_once_in_memory() / flush_state_to_db(): the production path since the
+  poller was merged into the API process (see app/main.py's lifespan). Polls
+  every 120s exactly as before, but computes against the in-memory
+  StaticCache instead of querying Postgres, and buffers results in
+  app.live_state.state instead of writing them immediately - Postgres is
+  only touched once/hour by flush_state_to_db(), so Neon can idle between
+  flushes.
 """
 
 from __future__ import annotations
@@ -128,6 +137,196 @@ def poll_once(session: Session) -> dict:
     }
     logger.info("Poll cycle complete: %s", summary)
     return summary
+
+
+def poll_once_in_memory(state) -> dict:  # state: app.live_state.LiveState
+    """In-memory equivalent of poll_once() - see module docstring. No
+    `session` parameter at all: a normal cycle never touches the database,
+    only fetches VIA's feeds (HTTP, not Postgres) and computes against
+    state.static_cache, which is loaded once at startup/refreshed daily
+    (see app/live_state.py) rather than queried here.
+    """
+    from app.live_state import build_live_vehicles, prune_recent_bunching_events
+
+    poll_time = datetime.datetime.now(datetime.timezone.utc)
+
+    vehicle_positions = fetch_vehicle_positions()
+    trip_updates = fetch_trip_updates()
+    logger.info("Polled %d vehicle positions, %d trip update stop-times", len(vehicle_positions), len(trip_updates))
+
+    state.last_poll_at = poll_time
+
+    if not any(vp["trip_id"] for vp in vehicle_positions) and not trip_updates:
+        logger.info("No active trips this cycle - live vehicle list cleared, nothing buffered.")
+        state.live_vehicles = []
+        return {
+            "polled_at": poll_time.isoformat(),
+            "vehicle_positions": len(vehicle_positions),
+            "trip_update_stop_times": len(trip_updates),
+            "deviations_from_trip_updates": 0,
+            "deviations_from_vehicle_positions": 0,
+            "headway_samples": 0,
+            "new_bunching_events": 0,
+            "skipped_db": True,
+        }
+
+    trip_context = state.static_cache.trip_context
+
+    snapshots = [
+        VehiclePositionSnapshot(
+            vehicle_id=vp["vehicle_id"],
+            trip_id=vp["trip_id"],
+            route_id=vp["route_id"],
+            latitude=vp["latitude"],
+            longitude=vp["longitude"],
+            bearing=vp["bearing"],
+            speed=vp["speed"],
+            current_stop_sequence=vp["current_stop_sequence"],
+            stop_id=vp["stop_id"],
+            current_status=vp["current_status"],
+            vehicle_timestamp=_epoch_to_utc(vp["timestamp"]),
+            polled_at=poll_time,
+        )
+        for vp in vehicle_positions
+    ]
+    state.pending_snapshots.extend(snapshots)
+
+    tu_deviations = compute_deviations_from_trip_updates(None, trip_updates, trip_context=trip_context)
+    vp_deviations = compute_deviations_from_vehicle_positions(None, vehicle_positions, trip_context=trip_context)
+    # Same dedup semantics as the two separate upsert_schedule_deviations()
+    # calls poll_once() makes (tu first, then vp - vp wins a same-key
+    # collision since ON CONFLICT DO UPDATE applies whichever runs last),
+    # just as one dict instead of two SQL upserts.
+    for d in tu_deviations:
+        key = (d.trip_id, d.stop_sequence, d.service_date, d.event_type)
+        state.pending_deviations[key] = d
+    for d in vp_deviations:
+        key = (d.trip_id, d.stop_sequence, d.service_date, d.event_type)
+        state.pending_deviations[key] = d
+
+    trip_delays: dict[str, float] = {d.trip_id: d.delay_seconds for d in vp_deviations}
+    trip_delays.update({d.trip_id: d.delay_seconds for d in tu_deviations})
+
+    threshold_minutes_seconds = _bunching_merge_window_seconds()
+    merge_window = datetime.timedelta(seconds=threshold_minutes_seconds)
+    headway_samples, bunching_events = detect_bunching(
+        None,
+        vehicle_positions,
+        trip_delays,
+        poll_time,
+        trip_context=trip_context,
+        recent_events=state.recent_bunching_events,
+    )
+    state.pending_headway_samples.extend(headway_samples)
+    # detect_bunching() mutates existing events from recent_events in place
+    # (already tracked there) - only brand-new ones need to be added.
+    state.recent_bunching_events.extend(bunching_events)
+    prune_recent_bunching_events(poll_time, merge_window)
+
+    state.live_vehicles = build_live_vehicles(vehicle_positions, state.static_cache, state.pending_deviations)
+
+    summary = {
+        "polled_at": poll_time.isoformat(),
+        "vehicle_positions": len(vehicle_positions),
+        "trip_update_stop_times": len(trip_updates),
+        "deviations_from_trip_updates": len(tu_deviations),
+        "deviations_from_vehicle_positions": len(vp_deviations),
+        "headway_samples": len(headway_samples),
+        "new_bunching_events": len(bunching_events),
+    }
+    logger.info("Poll cycle complete (in-memory): %s", summary)
+    return summary
+
+
+def _bunching_merge_window_seconds() -> int:
+    from app.config import settings
+    from app.gtfs.bunching import EVENT_MERGE_WINDOW_MULTIPLIER
+
+    return settings.gtfs_rt_poll_seconds * EVENT_MERGE_WINDOW_MULTIPLIER
+
+
+def flush_state_to_db(state, session: Session) -> dict:  # state: app.live_state.LiveState
+    """Write everything buffered in `state` to Postgres in one transaction -
+    the only time a normal poll cycle actually touches the database. Safe to
+    call with an empty buffer (e.g. right after the previous flush, or
+    during a stretch of skipped/empty polls) - each step is a no-op if its
+    list/dict is empty.
+
+    Deliberately does NOT clear pending_deviations or recent_bunching_events
+    afterward, only prunes them by age - both are re-flushed on subsequent
+    hourly cycles even when unchanged (upsert_schedule_deviations is
+    idempotent, and re-writing an unchanged BunchingEvent row is harmless),
+    because both are still needed in memory afterward: pending_deviations
+    for the live map's "most recently computed, any stop" fallback lookup
+    (see live_state.build_live_vehicles), and recent_bunching_events so an
+    event that started before this flush and continues after it is still
+    found and extended rather than split into two rows.
+    """
+    from app.gtfs.timezone_utils import AGENCY_TIMEZONE
+
+    # SQLAlchemy expires ORM object attributes after commit() by default -
+    # every later read of a field on one of these objects would silently
+    # trigger its own fresh SELECT. Since state.recent_bunching_events keeps
+    # referencing these same objects across many poll cycles after they're
+    # flushed (see docstring above), that default would mean every future
+    # detect_bunching() extend-lookup quietly re-opens a database connection
+    # per event touched - exactly what this whole change is meant to avoid.
+    # Disabling it (on this session only, not the app-wide sessionmaker) is
+    # what makes those later in-memory reads actually stay in memory.
+    session.expire_on_commit = False
+
+    flushed_at = datetime.datetime.now(datetime.timezone.utc)
+
+    snapshot_count = len(state.pending_snapshots)
+    if state.pending_snapshots:
+        session.add_all(state.pending_snapshots)
+
+    deviation_count = len(state.pending_deviations)
+    if state.pending_deviations:
+        upsert_schedule_deviations(session, list(state.pending_deviations.values()))
+
+    headway_count = len(state.pending_headway_samples)
+    if state.pending_headway_samples:
+        session.add_all(state.pending_headway_samples)
+
+    new_bunching = [e for e in state.recent_bunching_events if getattr(e, "_dirty", False) and e.id is None]
+    updated_bunching = [e for e in state.recent_bunching_events if getattr(e, "_dirty", False) and e.id is not None]
+    if new_bunching:
+        session.add_all(new_bunching)
+    for e in updated_bunching:
+        session.merge(e)
+
+    session.commit()
+
+    for e in state.recent_bunching_events:
+        e._dirty = False
+
+    state.pending_snapshots = []
+    state.pending_headway_samples = []
+    # Prune stale deviations (older than the same 2-day floor used
+    # elsewhere - see vehicles_service.py's service_date_floor comment) so
+    # this dict doesn't grow unboundedly hour over hour.
+    today_agency_local = datetime.datetime.now(_zoneinfo(AGENCY_TIMEZONE)).date()
+    floor = today_agency_local - datetime.timedelta(days=1)
+    state.pending_deviations = {k: d for k, d in state.pending_deviations.items() if d.service_date >= floor}
+
+    state.last_flush_at = flushed_at
+    summary = {
+        "flushed_at": flushed_at.isoformat(),
+        "snapshots": snapshot_count,
+        "deviations": deviation_count,
+        "headway_samples": headway_count,
+        "new_bunching_events": len(new_bunching),
+        "updated_bunching_events": len(updated_bunching),
+    }
+    logger.info("Flushed buffered state to Postgres: %s", summary)
+    return summary
+
+
+def _zoneinfo(tz_name: str):
+    from zoneinfo import ZoneInfo
+
+    return ZoneInfo(tz_name)
 
 
 def run_scheduler() -> None:

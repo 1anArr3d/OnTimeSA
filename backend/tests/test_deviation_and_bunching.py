@@ -277,3 +277,75 @@ def test_ongoing_bunching_event_extended_not_duplicated(session):
     assert session.query(BunchingEvent).count() == 1
     stored_end_time = session.query(BunchingEvent).one().end_time
     assert stored_end_time.replace(tzinfo=datetime.timezone.utc) == t1
+
+
+def test_bunching_event_spanning_flush_boundary_merges_not_splits(session):
+    """The in-memory poll loop (app/poller.py's poll_once_in_memory) buffers
+    bunching events and only flushes to Postgres roughly hourly - see
+    app/live_state.py. A bunching event that starts before a flush and
+    continues after it must still extend the same row on the next poll, not
+    split into two, even though the object may have already been written
+    (and had its id assigned) by an intervening flush. Exercises the actual
+    flush_state_to_db() used in production, not just detect_bunching() in
+    isolation.
+    """
+    from app.live_state import LiveState
+    from app.poller import flush_state_to_db
+
+    _seed_route_and_calendar(session)
+    _seed_stop(session, "S_COMMON", 29.50, -98.50)
+    _seed_stop(session, "S1", 29.49, -98.51)
+    _seed_trip(session, "LEAD", "R1", [(1, "S1", 27600), (2, "S_COMMON", 27700)])
+    _seed_trip(session, "FOLLOW", "R1", [(1, "S1", 28800), (2, "S_COMMON", 28900)])
+
+    vehicle_positions = [
+        {
+            "vehicle_id": "BUS_LEAD", "trip_id": "LEAD", "route_id": "R1", "direction_id": 0,
+            "latitude": 29.50, "longitude": -98.50, "current_stop_sequence": 2, "stop_id": "S_COMMON",
+            "current_status": "IN_TRANSIT_TO", "start_date": None, "timestamp": None, "bearing": None, "speed": None,
+        },
+        {
+            "vehicle_id": "BUS_FOLLOW", "trip_id": "FOLLOW", "route_id": "R1", "direction_id": 0,
+            "latitude": 29.495, "longitude": -98.505, "current_stop_sequence": 1, "stop_id": "S1",
+            "current_status": "IN_TRANSIT_TO", "start_date": None, "timestamp": None, "bearing": None, "speed": None,
+        },
+    ]
+    trip_delays = {"LEAD": 1100.0, "FOLLOW": 0.0}
+
+    state = LiveState()
+
+    # Poll 1: event starts, buffered but not yet flushed.
+    t0 = datetime.datetime.now(datetime.timezone.utc)
+    headway, events = detect_bunching(
+        session, vehicle_positions, trip_delays, t0, recent_events=state.recent_bunching_events
+    )
+    state.recent_bunching_events.extend(events)
+    assert len(state.recent_bunching_events) == 1
+    assert state.recent_bunching_events[0].id is None  # not written yet
+
+    # Flush boundary: this is the hourly write. The event now has a DB id.
+    flush_state_to_db(state, session)
+    assert session.query(BunchingEvent).count() == 1
+    event_after_first_flush = session.query(BunchingEvent).one()
+    assert state.recent_bunching_events[0].id == event_after_first_flush.id
+    assert state.recent_bunching_events[0]._dirty is False
+
+    # Poll 2: same bunching pair, still ongoing, AFTER the flush - the
+    # existing-event lookup must find the already-flushed object (it's still
+    # in recent_bunching_events, pruned by age not by flush status) and
+    # extend it rather than creating a second event.
+    t1 = t0 + datetime.timedelta(seconds=45)
+    headway2, events2 = detect_bunching(
+        session, vehicle_positions, trip_delays, t1, recent_events=state.recent_bunching_events
+    )
+    assert events2 == []  # extended the existing one in place, not a new event
+    assert state.recent_bunching_events[0].end_time == t1
+    assert state.recent_bunching_events[0]._dirty is True  # extended, needs re-flushing
+
+    # Flush again: must UPDATE the same row, not insert a second one.
+    flush_state_to_db(state, session)
+    assert session.query(BunchingEvent).count() == 1
+    final_event = session.query(BunchingEvent).one()
+    assert final_event.id == event_after_first_flush.id
+    assert final_event.end_time.replace(tzinfo=datetime.timezone.utc) == t1
+    assert final_event.start_time.replace(tzinfo=datetime.timezone.utc) == t0

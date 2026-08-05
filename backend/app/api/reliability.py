@@ -1,12 +1,12 @@
-from __future__ import annotations
-
 import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import get_db
 from app.models import Route
+from app.rate_limit import limiter
 from app.reliability_service import compute_group_reliability, compute_segment_reliability
 from app.schemas import ReliabilityStats
 
@@ -24,7 +24,10 @@ def _default_date_range(
 
 
 @router.get("/segment", response_model=ReliabilityStats)
+@limiter.limit(settings.rate_limit_reliability)
 def get_segment_reliability(
+    request: Request,
+    response: Response,  # required by slowapi's decorator, see vehicles.py's endpoint docstring
     route_id: str,
     start_stop_id: str,
     end_stop_id: str,
@@ -56,7 +59,10 @@ def get_segment_reliability(
 
 
 @router.get("/worst-offenders", response_model=list[ReliabilityStats])
+@limiter.limit(settings.rate_limit_reliability)
 def get_worst_offenders(
+    request: Request,
+    response: Response,  # required by slowapi's decorator, see vehicles.py's endpoint docstring
     group_by: str = Query("route", pattern="^(route|stop)$"),
     route_id: str | None = None,
     start_date: datetime.date | None = None,

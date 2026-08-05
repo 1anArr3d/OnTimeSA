@@ -46,5 +46,25 @@ class Settings(BaseSettings):
         "http://localhost:5175",
     ]
 
+    # How often buffered poll data (snapshots, deviations, headway samples,
+    # bunching events) is written to Postgres - see app/live_state.py and
+    # app/poller.py's flush_state_to_db(). The poller itself keeps polling
+    # VIA's feeds every gtfs_rt_poll_seconds regardless; this only controls
+    # how often that buffered data actually reaches the database.
+    flush_interval_seconds: int = 3600
+    # How often the in-memory static schedule cache (routes/stops/trips/
+    # stop_times) is reloaded from Postgres - the static feed itself only
+    # changes about once a day, so this doesn't need to be frequent.
+    static_cache_refresh_hours: int = 24
+
+    # Per-IP rate limits (slowapi syntax, e.g. "60/minute"). vehicles_live is
+    # looser since /api/vehicles/live now serves from memory (see
+    # app/live_state.py) rather than querying Postgres; reliability/bunching
+    # stay tighter since those still hit Postgres and can span wide date
+    # ranges. default applies to every other /api/ route (catalog lookups).
+    rate_limit_default: str = "60/minute"
+    rate_limit_vehicles_live: str = "30/minute"
+    rate_limit_reliability: str = "10/minute"
+
 
 settings = Settings()
