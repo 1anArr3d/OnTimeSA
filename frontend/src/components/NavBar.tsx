@@ -18,7 +18,7 @@ export function NavBar() {
         background: "var(--surface-1)",
       }}
     >
-      <span style={{ fontWeight: 700, marginRight: 16 }}>SA Transit Pulse</span>
+      <span style={{ fontWeight: 700, marginRight: 16 }}>OnTimeSA</span>
       {LINKS.map((link) => (
         <NavLink
           key={link.to}

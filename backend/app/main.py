@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import bunching, catalog, reliability, vehicles
 from app.config import settings
 
-app = FastAPI(title="SA Transit Pulse API")
+app = FastAPI(title="OnTimeSA API")
 
 app.add_middleware(
     CORSMiddleware,
