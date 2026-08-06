@@ -57,13 +57,27 @@ def _poll_job() -> None:
 
 
 def _maybe_refresh_static_cache(now: datetime.datetime) -> None:
+    """Refresh whenever the agency-local calendar date has advanced past what
+    the cache's service window covers, not just on elapsed hours - since
+    load_static_cache() now scopes to today/yesterday's active service
+    (see its docstring) rather than the whole schedule, a pure age-based
+    check could leave the cache one calendar day stale for however long it
+    takes static_cache_refresh_hours to elapse from whenever the process
+    happened to start, silently missing that day's actual service in the
+    meantime. The age check is kept too, as a secondary safety net.
+    """
+    from zoneinfo import ZoneInfo
+
     from app.db import get_sessionmaker
+    from app.gtfs.timezone_utils import AGENCY_TIMEZONE
     from app.live_state import load_static_cache, state
 
     if state.static_cache is None:
         return
+    today_agency_local = now.astimezone(ZoneInfo(AGENCY_TIMEZONE)).date()
+    date_rolled_over = today_agency_local != state.static_cache.loaded_for_date
     age_hours = (now - state.static_cache.loaded_at).total_seconds() / 3600
-    if age_hours < settings.static_cache_refresh_hours:
+    if not date_rolled_over and age_hours < settings.static_cache_refresh_hours:
         return
 
     session = get_sessionmaker()()

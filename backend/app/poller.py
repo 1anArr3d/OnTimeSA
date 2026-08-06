@@ -146,7 +146,13 @@ def poll_once_in_memory(state) -> dict:  # state: app.live_state.LiveState
     state.static_cache, which is loaded once at startup/refreshed daily
     (see app/live_state.py) rather than queried here.
     """
-    from app.live_state import build_live_vehicles, prune_recent_bunching_events
+    from app.live_state import (
+        build_live_vehicles,
+        prune_pending_deviations,
+        prune_pending_headway_samples,
+        prune_pending_snapshots,
+        prune_recent_bunching_events,
+    )
 
     poll_time = datetime.datetime.now(datetime.timezone.utc)
 
@@ -223,6 +229,22 @@ def poll_once_in_memory(state) -> dict:  # state: app.live_state.LiveState
     state.recent_bunching_events.extend(bunching_events)
     prune_recent_bunching_events(poll_time, merge_window)
 
+    # Age/size-bound the write buffers every cycle, independent of whether the
+    # next flush succeeds - see _pending_buffer_max_age()'s docstring for why.
+    prune_pending_deviations(poll_time)
+    max_pending_age = _pending_buffer_max_age()
+    dropped_snapshots = prune_pending_snapshots(poll_time, max_pending_age)
+    dropped_headway_samples = prune_pending_headway_samples(poll_time, max_pending_age)
+    if dropped_snapshots or dropped_headway_samples:
+        logger.warning(
+            "Pending buffer exceeded %s of unflushed data - dropped %d snapshots, "
+            "%d headway samples (%s)",
+            max_pending_age,
+            dropped_snapshots,
+            dropped_headway_samples,
+            _flush_staleness_description(poll_time),
+        )
+
     state.live_vehicles = build_live_vehicles(vehicle_positions, state.static_cache, state.pending_deviations)
 
     summary = {
@@ -245,6 +267,26 @@ def _bunching_merge_window_seconds() -> int:
     return settings.gtfs_rt_poll_seconds * EVENT_MERGE_WINDOW_MULTIPLIER
 
 
+def _pending_buffer_max_age() -> datetime.timedelta:
+    """How much unflushed data pending_snapshots/pending_headway_samples are
+    allowed to hold before the oldest gets dropped - see
+    settings.pending_buffer_retention_multiplier's docstring. A flush retries
+    every poll cycle once due (see _poll_job in app/main.py), so this only
+    ever bites during a sustained outage, not routine hourly flushing.
+    """
+    from app.config import settings
+
+    return datetime.timedelta(seconds=settings.flush_interval_seconds * settings.pending_buffer_retention_multiplier)
+
+
+def _flush_staleness_description(now: datetime.datetime) -> str:
+    from app.live_state import state
+
+    if state.last_flush_at is None:
+        return "flush has never succeeded since this process started"
+    return f"flush has been failing for {now - state.last_flush_at}"
+
+
 def flush_state_to_db(state, session: Session) -> dict:  # state: app.live_state.LiveState
     """Write everything buffered in `state` to Postgres in one transaction -
     the only time a normal poll cycle actually touches the database. Safe to
@@ -253,17 +295,18 @@ def flush_state_to_db(state, session: Session) -> dict:  # state: app.live_state
     list/dict is empty.
 
     Deliberately does NOT clear pending_deviations or recent_bunching_events
-    afterward, only prunes them by age - both are re-flushed on subsequent
-    hourly cycles even when unchanged (upsert_schedule_deviations is
-    idempotent, and re-writing an unchanged BunchingEvent row is harmless),
-    because both are still needed in memory afterward: pending_deviations
+    afterward - both are pruned by age elsewhere (live_state.
+    prune_pending_deviations() and prune_recent_bunching_events(), called
+    every poll cycle regardless of flush success) rather than here, and both
+    are re-flushed on subsequent hourly cycles even when unchanged
+    (upsert_schedule_deviations is idempotent, and re-writing an unchanged
+    BunchingEvent row is harmless), because both are still needed in memory
+    afterward: pending_deviations
     for the live map's "most recently computed, any stop" fallback lookup
     (see live_state.build_live_vehicles), and recent_bunching_events so an
     event that started before this flush and continues after it is still
     found and extended rather than split into two rows.
     """
-    from app.gtfs.timezone_utils import AGENCY_TIMEZONE
-
     # SQLAlchemy expires ORM object attributes after commit() by default -
     # every later read of a field on one of these objects would silently
     # trigger its own fresh SELECT. Since state.recent_bunching_events keeps
@@ -303,12 +346,9 @@ def flush_state_to_db(state, session: Session) -> dict:  # state: app.live_state
 
     state.pending_snapshots = []
     state.pending_headway_samples = []
-    # Prune stale deviations (older than the same 2-day floor used
-    # elsewhere - see vehicles_service.py's service_date_floor comment) so
-    # this dict doesn't grow unboundedly hour over hour.
-    today_agency_local = datetime.datetime.now(_zoneinfo(AGENCY_TIMEZONE)).date()
-    floor = today_agency_local - datetime.timedelta(days=1)
-    state.pending_deviations = {k: d for k, d in state.pending_deviations.items() if d.service_date >= floor}
+    # pending_deviations is no longer pruned here - see
+    # live_state.prune_pending_deviations(), now called unconditionally every
+    # poll cycle instead of only after a successful flush.
 
     state.last_flush_at = flushed_at
     summary = {
@@ -321,12 +361,6 @@ def flush_state_to_db(state, session: Session) -> dict:  # state: app.live_state
     }
     logger.info("Flushed buffered state to Postgres: %s", summary)
     return summary
-
-
-def _zoneinfo(tz_name: str):
-    from zoneinfo import ZoneInfo
-
-    return ZoneInfo(tz_name)
 
 
 def run_scheduler() -> None:

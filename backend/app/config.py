@@ -52,6 +52,16 @@ class Settings(BaseSettings):
     # VIA's feeds every gtfs_rt_poll_seconds regardless; this only controls
     # how often that buffered data actually reaches the database.
     flush_interval_seconds: int = 3600
+    # Safety cap on unflushed data held in memory (pending_snapshots,
+    # pending_headway_samples - see app/live_state.py), expressed as a
+    # multiple of flush_interval_seconds so it scales automatically if that's
+    # ever retuned instead of needing separate adjustment. A couple of missed
+    # flushes (normal retry-every-poll-cycle behavior) never trips this; a
+    # sustained outage degrades by dropping the oldest buffered data instead
+    # of growing unbounded - see the 2026-08-06 incident, where a stale DB
+    # credential left flushes failing for 9+ hours and the unbounded buffers
+    # were a direct contributor to the box being OOM-killed repeatedly.
+    pending_buffer_retention_multiplier: float = 4.0
     # How often the in-memory static schedule cache (routes/stops/trips/
     # stop_times) is reloaded from Postgres - the static feed itself only
     # changes about once a day, so this doesn't need to be frequent.
